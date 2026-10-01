@@ -1,0 +1,282 @@
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Gemini Document Assistant</title>
+  <style>
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      font-family: Arial, sans-serif;
+      background: #f4f6fb;
+      color: #202437;
+    }
+
+    .container {
+      max-width: 720px;
+      margin: 60px auto;
+      padding: 24px;
+    }
+
+    h1 {
+      margin-bottom: 8px;
+      font-size: 28px;
+    }
+
+    .subtitle {
+      color: #687087;
+      margin-bottom: 28px;
+      line-height: 1.5;
+    }
+
+    .card {
+      background: white;
+      padding: 24px;
+      border-radius: 14px;
+      margin-bottom: 20px;
+      box-shadow: 0 4px 18px rgba(30, 40, 80, 0.06);
+    }
+
+    h2 {
+      font-size: 18px;
+      margin: 0 0 16px;
+    }
+
+    input[type="file"],
+    textarea {
+      width: 100%;
+      padding: 12px;
+      border: 1px solid #d9deea;
+      border-radius: 8px;
+      font: inherit;
+      background: white;
+    }
+
+    textarea {
+      min-height: 100px;
+      resize: vertical;
+      margin-bottom: 12px;
+    }
+
+    button {
+      background: #4f46e5;
+      color: white;
+      border: 0;
+      padding: 12px 18px;
+      border-radius: 8px;
+      font-size: 14px;
+      font-weight: bold;
+      cursor: pointer;
+      margin-top: 14px;
+    }
+
+    button:hover {
+      background: #4338ca;
+    }
+
+    button:disabled {
+      background: #a5a5b5;
+      cursor: not-allowed;
+    }
+
+    .status {
+      margin-top: 14px;
+      font-size: 14px;
+      line-height: 1.5;
+    }
+
+    .success {
+      color: #16803c;
+    }
+
+    .error {
+      color: #c62828;
+    }
+
+    .answer {
+      white-space: pre-wrap;
+      line-height: 1.7;
+      color: #30364a;
+    }
+
+    .filename {
+      font-size: 13px;
+      color: #687087;
+      margin-top: 10px;
+    }
+
+    .hidden {
+      display: none;
+    }
+  </style>
+</head>
+
+<body>
+  <main class="container">
+    <h1>Gemini Document Assistant</h1>
+    <p class="subtitle">
+      Upload a text document and ask questions about its contents.
+    </p>
+
+    <section class="card">
+      <h2>1. Upload your document</h2>
+
+      <form id="uploadForm">
+        <input
+          type="file"
+          id="fileInput"
+          accept=".txt,text/plain"
+          required
+        />
+        <br />
+        <button type="submit" id="uploadButton">
+          Upload document
+        </button>
+      </form>
+
+      <div id="uploadStatus" class="status"></div>
+      <div id="filename" class="filename"></div>
+    </section>
+
+    <section class="card">
+      <h2>2. Ask a question</h2>
+
+      <form id="askForm">
+        <textarea
+          id="questionInput"
+          placeholder="Example: What is the company's annual leave policy?"
+          required
+        ></textarea>
+
+        <button type="submit" id="askButton" disabled>
+          Ask Gemini
+        </button>
+      </form>
+
+      <div id="askStatus" class="status"></div>
+
+      <div id="answerSection" class="hidden">
+        <h2 style="margin-top: 24px;">Answer</h2>
+        <div id="answer" class="answer"></div>
+      </div>
+    </section>
+  </main>
+
+  <script>
+    const uploadForm = document.getElementById("uploadForm");
+    const fileInput = document.getElementById("fileInput");
+    const uploadButton = document.getElementById("uploadButton");
+    const uploadStatus = document.getElementById("uploadStatus");
+    const filename = document.getElementById("filename");
+
+    const askForm = document.getElementById("askForm");
+    const questionInput = document.getElementById("questionInput");
+    const askButton = document.getElementById("askButton");
+    const askStatus = document.getElementById("askStatus");
+    const answerSection = document.getElementById("answerSection");
+    const answer = document.getElementById("answer");
+
+    let documentUploaded = false;
+
+    uploadForm.addEventListener("submit", async (event) => {
+      event.preventDefault();
+
+      const file = fileInput.files[0];
+
+      if (!file) {
+        uploadStatus.textContent = "Please select a file.";
+        uploadStatus.className = "status error";
+        return;
+      }
+
+      const formData = new FormData();
+      formData.append("file", file);
+
+      uploadButton.disabled = true;
+      uploadButton.textContent = "Uploading...";
+      uploadStatus.textContent = "";
+      filename.textContent = "";
+      documentUploaded = false;
+      askButton.disabled = true;
+
+      try {
+        const response = await fetch("/upload", {
+          method: "POST",
+          body: formData
+        });
+
+        const data = await response.json();
+
+        if (!response.ok) {
+          throw new Error(data.detail || "Upload failed.");
+        }
+
+        documentUploaded = true;
+        askButton.disabled = false;
+
+        uploadStatus.textContent = data.message;
+        uploadStatus.className = "status success";
+        filename.textContent =
+          `Current document: ${data.filename} (${data.characters} characters)`;
+
+      } catch (error) {
+        uploadStatus.textContent = error.message;
+        uploadStatus.className = "status error";
+      } finally {
+        uploadButton.disabled = false;
+        uploadButton.textContent = "Upload document";
+      }
+    });
+
+    askForm.addEventListener("submit", async (event) => {
+      event.preventDefault();
+
+      const question = questionInput.value.trim();
+
+      if (!documentUploaded) {
+        askStatus.textContent = "Upload a document first.";
+        askStatus.className = "status error";
+        return;
+      }
+
+      if (!question) return;
+
+      askButton.disabled = true;
+      askButton.textContent = "Thinking...";
+      askStatus.textContent = "";
+      answerSection.classList.add("hidden");
+
+      try {
+        const response = await fetch("/ask", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify({ question })
+        });
+
+        const data = await response.json();
+
+        if (!response.ok) {
+          throw new Error(data.detail || "Could not get an answer.");
+        }
+
+        answer.textContent = data.answer;
+        answerSection.classList.remove("hidden");
+        askStatus.textContent = "";
+      } catch (error) {
+        askStatus.textContent = error.message;
+        askStatus.className = "status error";
+      } finally {
+        askButton.disabled = false;
+        askButton.textContent = "Ask Gemini";
+      }
+    });
+  </script>
+</body>
+</html>
