@@ -1,0 +1,7 @@
+
+google-genai
+python-dotenv
+pypdf
+sentence-transformers
+numpy
+faiss-cpu
