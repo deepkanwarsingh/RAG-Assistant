@@ -10,7 +10,6 @@ load_dotenv()
 
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from google import genai
 
@@ -30,18 +29,12 @@ app = FastAPI(title="Gemini RAG Document Assistant")
 
 UPLOAD_DIR = Path("uploads")
 UPLOAD_DIR.mkdir(exist_ok=True)
-
-app.mount("/static", StaticFiles(directory="static"), name="static")
+FRONTEND_DIST = Path(__file__).resolve().parent / "frontend" / "dist"
 
 
 class QuestionRequest(BaseModel):
     document_id: str
     question: str
-
-
-@app.get("/")
-def home():
-    return FileResponse("static/index.html")
 
 
 @app.post("/upload")
@@ -173,4 +166,15 @@ QUESTION:
         raise HTTPException(
             status_code=502,
             detail="Could not retrieve or generate an answer."
+        )
+
+
+if FRONTEND_DIST.is_dir():
+    app.mount("/", StaticFiles(directory=FRONTEND_DIST, html=True), name="frontend")
+else:
+    @app.get("/")
+    def frontend_not_built():
+        raise HTTPException(
+            status_code=503,
+            detail="Frontend build not found. Run npm --prefix frontend run build."
         )
