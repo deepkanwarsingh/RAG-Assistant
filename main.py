@@ -1,10 +1,13 @@
 import os
 import json
+import logging
 import uuid
 import shutil
 from pathlib import Path
 
+import httpx
 from dotenv import load_dotenv
+from google.genai.errors import APIError
 
 # Load .env before importing services
 load_dotenv()
@@ -24,6 +27,8 @@ from services.conversation_store import (
     get_conversation,
     get_messages,
 )
+
+logger = logging.getLogger(__name__)
 
 load_dotenv()
 
@@ -104,6 +109,58 @@ def sse_event(name, data):
     return f"event: {name}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
 
 
+def explain_error(error, operation):
+    if isinstance(error, APIError):
+        code = error.code
+        provider_message = " ".join(str(error.message or "").split())[:500]
+        reason = f" Gemini's reason: {provider_message}" if provider_message else ""
+
+        if code == 429:
+            return 429, (
+                f"Gemini's request or usage quota has been reached.{reason} "
+                "Wait briefly before retrying, or check the Gemini API quota and billing settings."
+            )
+        if code == 503:
+            return 503, (
+                f"Gemini is temporarily overloaded or unavailable.{reason} "
+                "Please retry in a little while."
+            )
+        if code in (500, 502, 504):
+            return 503, (
+                f"Gemini had a temporary server-side failure (HTTP {code}).{reason} "
+                "Please retry in a little while."
+            )
+        if code in (401, 403):
+            return 502, (
+                f"Gemini rejected this request because of an API credential or permission issue "
+                f"(HTTP {code}).{reason} Check the API key and model access configuration."
+            )
+        return 502, (
+            f"Gemini could not complete the request (HTTP {code}).{reason} "
+            "Check the request and try again."
+        )
+
+    if isinstance(error, httpx.TimeoutException):
+        return 504, (
+            f"The request timed out while {operation}. The AI service may be busy; "
+            "please retry."
+        )
+    if isinstance(error, httpx.NetworkError):
+        return 503, (
+            f"The AI service could not be reached while {operation}. "
+            "Check the connection and retry."
+        )
+    if operation == "processing your document" and isinstance(error, ValueError):
+        return 422, str(error)
+
+    reference = uuid.uuid4().hex[:10]
+    logger.exception("Unexpected failure while %s (reference %s)", operation, reference)
+    return 500, (
+        f"An unexpected error occurred while {operation}. Please retry. "
+        f"Reference: {reference}."
+    )
+
+
 def resolve_conversation(document_id, conversation_id):
     if not conversation_id:
         return create_conversation(document_id)
@@ -174,10 +231,10 @@ async def upload_document(file: UploadFile = File(...)):
         raise
     except Exception as error:
         safe_path.unlink(missing_ok=True)
-        print("Upload error:", error)
+        status_code, detail = explain_error(error, "processing your document")
         raise HTTPException(
-            status_code=500,
-            detail="Could not process this document."
+            status_code=status_code,
+            detail=detail
         )
 
 
@@ -229,10 +286,10 @@ async def ask_question(request: QuestionRequest):
         }
 
     except Exception as error:
-        print("Question error:", error)
+        status_code, detail = explain_error(error, "searching your document or generating an answer")
         raise HTTPException(
-            status_code=502,
-            detail="Could not retrieve or generate an answer."
+            status_code=status_code,
+            detail=detail
         )
 
 
@@ -260,10 +317,10 @@ def ask_question_stream(request: QuestionRequest):
             top_k=5
         )
     except Exception as error:
-        print("Question retrieval error:", error)
+        status_code, detail = explain_error(error, "searching your document")
         raise HTTPException(
-            status_code=502,
-            detail="Could not retrieve or generate an answer."
+            status_code=status_code,
+            detail=detail
         )
 
     sources = build_sources(matches)
@@ -300,10 +357,10 @@ def ask_question_stream(request: QuestionRequest):
             add_message(conversation_id, "assistant", answer, sources)
             yield sse_event("done", {})
         except Exception as error:
-            print("Question streaming error:", error)
+            _, detail = explain_error(error, "generating an answer")
             yield sse_event(
                 "error",
-                {"detail": "Could not retrieve or generate an answer."}
+                {"detail": detail}
             )
 
     return StreamingResponse(

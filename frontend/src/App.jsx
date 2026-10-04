@@ -78,6 +78,39 @@ async function readEventStream(response, onEvent) {
   if (!completed) throw new Error('The answer stream ended unexpectedly.');
 }
 
+function collectConversationSources(messages) {
+  const sources = new Map();
+  let currentQuestion = '';
+
+  for (const message of messages) {
+    if (message.role === 'user') {
+      currentQuestion = message.content;
+      continue;
+    }
+
+    for (const source of message.sources ?? []) {
+      const key = `${source.page ?? 'text'}\u0000${source.text ?? ''}`;
+      let entry = sources.get(key);
+      if (!entry) {
+        entry = { ...source, references: [] };
+        sources.set(key, entry);
+      }
+
+      const reference = {
+        label: source.source || 'Source',
+        question: currentQuestion,
+      };
+      if (!entry.references.some((item) => (
+        item.label === reference.label && item.question === reference.question
+      ))) {
+        entry.references.push(reference);
+      }
+    }
+  }
+
+  return [...sources.values()];
+}
+
 export default function App() {
   const [file, setFile] = useState(null);
   const [documentInfo, setDocumentInfo] = useState(null);
@@ -90,6 +123,7 @@ export default function App() {
   const [uploading, setUploading] = useState(false);
   const [asking, setAsking] = useState(false);
   const [restoring, setRestoring] = useState(true);
+  const conversationSources = collectConversationSources(messages);
 
   useEffect(() => {
     let cancelled = false;
@@ -333,22 +367,26 @@ export default function App() {
                 <div className={message.role === 'user' ? 'user-message' : 'answer'}>
                   {message.content || (asking && index === messages.length - 1 ? 'Generating answer...' : 'No answer was returned.')}
                 </div>
-                {message.role === 'assistant' && message.sources?.length > 0 && (
-                  <div className="sources">
-                    <h3>Document sources</h3>
-                    {message.sources.map((source, sourceIndex) => (
-                      <article className="source-card" key={`${message.id ?? index}-${source.source ?? sourceIndex}`}>
-                        <h4 className="source-title">
-                          {source.source || `Source ${sourceIndex + 1}`} · {source.page ? `Page ${source.page}` : 'Text file'}
-                        </h4>
-                        <p className="source-text">{source.text || ''}</p>
-                      </article>
-                    ))}
-                  </div>
-                )}
               </article>
             ))}
           </div>
+        )}
+
+        {conversationSources.length > 0 && (
+          <section className="conversation-sources" aria-labelledby="sources-heading">
+            <h3 id="sources-heading">Document sources</h3>
+            {conversationSources.map((source, index) => (
+              <article className="source-card" key={`${source.page ?? 'text'}-${index}`}>
+                <h4 className="source-title">
+                  {source.references.map((reference) => reference.label).join(', ')} · {source.page ? `Page ${source.page}` : 'Text file'}
+                </h4>
+                <p className="source-text">{source.text || ''}</p>
+                <p className="source-reference">
+                  Used for: {source.references.map((reference) => reference.question).filter(Boolean).join(' / ')}
+                </p>
+              </article>
+            ))}
+          </section>
         )}
       </section>
 
