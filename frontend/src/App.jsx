@@ -1,4 +1,30 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
+
+const SESSION_STORAGE_KEY = 'rag-assistant-session';
+
+function readSavedSession() {
+  try {
+    return JSON.parse(localStorage.getItem(SESSION_STORAGE_KEY) || 'null');
+  } catch {
+    return null;
+  }
+}
+
+function saveSession(session) {
+  try {
+    localStorage.setItem(SESSION_STORAGE_KEY, JSON.stringify(session));
+  } catch {
+    // The backend remains the source of truth if browser storage is unavailable.
+  }
+}
+
+function clearSession() {
+  try {
+    localStorage.removeItem(SESSION_STORAGE_KEY);
+  } catch {
+    // Ignore unavailable browser storage.
+  }
+}
 
 function getErrorMessage(data, fallback) {
   return typeof data.detail === 'string' ? data.detail : fallback;
@@ -12,16 +38,95 @@ async function readResponse(response, fallback) {
   return data;
 }
 
+async function readEventStream(response, onEvent) {
+  if (!response.body) {
+    throw new Error('The server did not provide a readable answer stream.');
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let completed = false;
+
+  function dispatchFrame(frame) {
+    const lines = frame.split('\n').map((line) => line.endsWith('\r') ? line.slice(0, -1) : line);
+    const eventLine = lines.find((line) => line.startsWith('event:'));
+    const dataLines = lines.filter((line) => line.startsWith('data:'));
+    if (dataLines.length === 0) return;
+
+    const eventName = eventLine ? eventLine.slice(6).trim() : 'message';
+    const data = JSON.parse(dataLines.map((line) => line.slice(5).trimStart()).join('\n'));
+    onEvent(eventName, data);
+    if (eventName === 'done') completed = true;
+  }
+
+  while (true) {
+    const { value, done } = await reader.read();
+    buffer += decoder.decode(value, { stream: !done });
+
+    let boundary = buffer.indexOf('\n\n');
+    while (boundary !== -1) {
+      dispatchFrame(buffer.slice(0, boundary));
+      buffer = buffer.slice(boundary + 2);
+      boundary = buffer.indexOf('\n\n');
+    }
+
+    if (done) break;
+  }
+
+  if (buffer.trim()) dispatchFrame(buffer);
+  if (!completed) throw new Error('The answer stream ended unexpectedly.');
+}
+
 export default function App() {
   const [file, setFile] = useState(null);
   const [documentInfo, setDocumentInfo] = useState(null);
   const [documentId, setDocumentId] = useState(null);
+  const [conversationId, setConversationId] = useState(null);
+  const [messages, setMessages] = useState([]);
   const [question, setQuestion] = useState('');
   const [uploadStatus, setUploadStatus] = useState(null);
   const [askStatus, setAskStatus] = useState(null);
-  const [answerData, setAnswerData] = useState(null);
   const [uploading, setUploading] = useState(false);
   const [asking, setAsking] = useState(false);
+  const [restoring, setRestoring] = useState(true);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    async function restoreSession() {
+      const savedSession = readSavedSession();
+      if (!savedSession?.documentId) {
+        setRestoring(false);
+        return;
+      }
+
+      setDocumentId(savedSession.documentId);
+      setDocumentInfo(savedSession.documentInfo ?? null);
+
+      if (savedSession.conversationId) {
+        try {
+          const response = await fetch(
+            `/conversations/${encodeURIComponent(savedSession.conversationId)}`,
+          );
+          const data = await readResponse(response, 'Could not restore this conversation.');
+          if (cancelled) return;
+          setConversationId(data.conversation_id);
+          setMessages(data.messages ?? []);
+        } catch {
+          if (cancelled) return;
+          saveSession({ ...savedSession, conversationId: null });
+          setConversationId(null);
+          setMessages([]);
+        }
+      }
+
+      if (!cancelled) setRestoring(false);
+    }
+
+    restoreSession();
+    return () => { cancelled = true; };
+  }, []);
 
   async function handleUpload(event) {
     event.preventDefault();
@@ -45,9 +150,11 @@ export default function App() {
       text: 'Uploading, extracting text and creating document chunks...',
     });
     setDocumentId(null);
+    setConversationId(null);
     setDocumentInfo(null);
-    setAnswerData(null);
+    setMessages([]);
     setAskStatus(null);
+    clearSession();
 
     try {
       const response = await fetch('/upload', { method: 'POST', body: formData });
@@ -58,6 +165,11 @@ export default function App() {
 
       setDocumentId(data.document_id);
       setDocumentInfo(data);
+      saveSession({
+        documentId: data.document_id,
+        documentInfo: data,
+        conversationId: null,
+      });
       setUploadStatus({
         type: 'success',
         text: 'Document processed successfully. You can now ask questions.',
@@ -84,19 +196,63 @@ export default function App() {
 
     setAsking(true);
     setAskStatus({ type: 'pending', text: 'Searching your document...' });
-    setAnswerData(null);
+    setMessages((current) => [
+      ...current,
+      { role: 'user', content: trimmedQuestion, sources: [] },
+      { role: 'assistant', content: '', sources: [] },
+    ]);
+    setQuestion('');
 
     try {
-      const response = await fetch('/ask', {
+      const response = await fetch('/ask/stream', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ document_id: documentId, question: trimmedQuestion }),
+        body: JSON.stringify({
+          document_id: documentId,
+          question: trimmedQuestion,
+          conversation_id: conversationId,
+        }),
       });
-      const data = await readResponse(response, 'Could not get an answer.');
-      setAnswerData(data);
-      setAskStatus(null);
+
+      if (!response.ok) {
+        await readResponse(response, 'Could not get an answer.');
+      }
+
+      await readEventStream(response, (eventName, data) => {
+        if (eventName === 'conversation') {
+          setConversationId(data.conversation_id);
+          saveSession({
+            documentId,
+            documentInfo,
+            conversationId: data.conversation_id,
+          });
+        } else if (eventName === 'sources') {
+          setMessages((current) => current.map((message, index) => (
+            index === current.length - 1
+              ? { ...message, sources: data.sources ?? [] }
+              : message
+          )));
+        } else if (eventName === 'token') {
+          setMessages((current) => current.map((message, index) => (
+            index === current.length - 1
+              ? { ...message, content: message.content + (data.text ?? '') }
+              : message
+          )));
+          setAskStatus(null);
+        } else if (eventName === 'error') {
+          throw new Error(data.detail || 'Could not get an answer.');
+        } else if (eventName === 'done') {
+          setAskStatus(null);
+        }
+      });
     } catch (error) {
       setAskStatus({ type: 'error', text: error.message });
+      setMessages((current) => {
+        const lastMessage = current[current.length - 1];
+        return lastMessage?.role === 'assistant' && !lastMessage.content
+          ? current.slice(0, -1)
+          : current;
+      });
     } finally {
       setAsking(false);
     }
@@ -169,23 +325,29 @@ export default function App() {
         </form>
         {askStatus && <p className={`status ${askStatus.type}`} role="status">{askStatus.text}</p>}
 
-        {answerData && (
-          <div className="answer-section" aria-live="polite">
-            <h2>Answer</h2>
-            <div className="answer">{answerData.answer || 'No answer was returned.'}</div>
-            {Array.isArray(answerData.sources) && answerData.sources.length > 0 && (
-              <div className="sources">
-                <h3>Document sources</h3>
-                {answerData.sources.map((source, index) => (
-                  <article className="source-card" key={`${source.source ?? index}-${index}`}>
-                    <h4 className="source-title">
-                      {source.source || `Source ${index + 1}`} · {source.page ? `Page ${source.page}` : 'Text file'}
-                    </h4>
-                    <p className="source-text">{source.text || ''}</p>
-                  </article>
-                ))}
-              </div>
-            )}
+        {messages.length > 0 && (
+          <div className="conversation-history">
+            {messages.map((message, index) => (
+              <article className={`message-row ${message.role}`} key={message.id ?? `${index}-${message.role}`}>
+                <h3 className="message-role">{message.role === 'user' ? 'You' : 'Assistant'}</h3>
+                <div className={message.role === 'user' ? 'user-message' : 'answer'}>
+                  {message.content || (asking && index === messages.length - 1 ? 'Generating answer...' : 'No answer was returned.')}
+                </div>
+                {message.role === 'assistant' && message.sources?.length > 0 && (
+                  <div className="sources">
+                    <h3>Document sources</h3>
+                    {message.sources.map((source, sourceIndex) => (
+                      <article className="source-card" key={`${message.id ?? index}-${source.source ?? sourceIndex}`}>
+                        <h4 className="source-title">
+                          {source.source || `Source ${sourceIndex + 1}`} · {source.page ? `Page ${source.page}` : 'Text file'}
+                        </h4>
+                        <p className="source-text">{source.text || ''}</p>
+                      </article>
+                    ))}
+                  </div>
+                )}
+              </article>
+            ))}
           </div>
         )}
       </section>

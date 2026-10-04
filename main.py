@@ -1,4 +1,5 @@
 import os
+import json
 import uuid
 import shutil
 from pathlib import Path
@@ -9,6 +10,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from google import genai
@@ -16,6 +18,12 @@ from google import genai
 from services.document_loader import load_document
 from services.chunker import chunk_documents
 from services.vector_store import store_chunks, search_chunks
+from services.conversation_store import (
+    add_message,
+    create_conversation,
+    get_conversation,
+    get_messages,
+)
 
 load_dotenv()
 
@@ -35,6 +43,93 @@ FRONTEND_DIST = Path(__file__).resolve().parent / "frontend" / "dist"
 class QuestionRequest(BaseModel):
     document_id: str
     question: str
+    conversation_id: str | None = None
+
+
+def build_prompt(question, matches, history=None):
+    context_parts = []
+    for i, match in enumerate(matches, start=1):
+        page = match["metadata"].get("page", 0)
+        page_label = f"Page {page}" if page else "Text file"
+
+        context_parts.append(
+            f"[Source {i} | {page_label}]\n{match['text']}"
+        )
+
+    context = "\n\n".join(context_parts)
+    history_lines = [
+        f"{message['role'].capitalize()}: {message['content']}"
+        for message in history or []
+    ]
+    conversation_history = "\n".join(history_lines) or "No previous messages."
+    return f"""
+You are a document question-answering assistant.
+
+Use the conversation history only to understand follow-up questions. The SOURCES
+below are the only evidence you may use for factual claims.
+Answer the question using only the SOURCES below.
+Do not use outside knowledge.
+If the sources do not contain enough evidence, say:
+"I could not find that information in the document."
+
+CITATION RULES:
+- Cite claims using the source labels, like [Source 1].
+- Only cite sources that support the claim.
+- Do not invent page numbers or source labels.
+- If you cannot support the answer, do not guess.
+
+CONVERSATION HISTORY:
+{conversation_history}
+
+SOURCES:
+{context}
+
+QUESTION:
+{question}
+"""
+
+
+def build_sources(matches):
+    return [
+        {
+            "source": f"Source {i}",
+            "page": match["metadata"].get("page", 0) or None,
+            "text": match["text"]
+        }
+        for i, match in enumerate(matches, start=1)
+    ]
+
+
+def sse_event(name, data):
+    return f"event: {name}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+
+def resolve_conversation(document_id, conversation_id):
+    if not conversation_id:
+        return create_conversation(document_id)
+
+    conversation = get_conversation(conversation_id)
+    if conversation is None:
+        raise HTTPException(status_code=404, detail="Conversation not found.")
+    if conversation["document_id"] != document_id:
+        raise HTTPException(
+            status_code=409,
+            detail="Conversation belongs to a different document."
+        )
+    return conversation_id
+
+
+@app.get("/conversations/{conversation_id}")
+def get_conversation_history(conversation_id: str):
+    conversation = get_conversation(conversation_id)
+    if conversation is None:
+        raise HTTPException(status_code=404, detail="Conversation not found.")
+
+    return {
+        "conversation_id": conversation_id,
+        "document_id": conversation["document_id"],
+        "messages": get_messages(conversation_id)
+    }
 
 
 @app.post("/upload")
@@ -96,6 +191,13 @@ async def ask_question(request: QuestionRequest):
             detail="Question cannot be empty."
         )
 
+    conversation_id = resolve_conversation(
+        request.document_id,
+        request.conversation_id
+    )
+    history = get_messages(conversation_id, limit=12)
+    add_message(conversation_id, "user", question)
+
     try:
         matches = search_chunks(
             document_id=request.document_id,
@@ -104,61 +206,26 @@ async def ask_question(request: QuestionRequest):
         )
 
         if not matches:
+            answer = "I could not find that information in the document."
+            add_message(conversation_id, "assistant", answer)
             return {
-                "answer": "I could not find that information in the document.",
-                "sources": []
+                "answer": answer,
+                "sources": [],
+                "conversation_id": conversation_id
             }
-
-        context_parts = []
-        for i, match in enumerate(matches, start=1):
-            page = match["metadata"].get("page", 0)
-            page_label = f"Page {page}" if page else "Text file"
-
-            context_parts.append(
-                f"[Source {i} | {page_label}]\n{match['text']}"
-            )
-
-        context = "\n\n".join(context_parts)
-
-        prompt = f"""
-You are a document question-answering assistant.
-
-Answer the question using only the SOURCES below.
-Do not use outside knowledge.
-If the sources do not contain enough evidence, say:
-"I could not find that information in the document."
-
-CITATION RULES:
-- Cite claims using the source labels, like [Source 1].
-- Only cite sources that support the claim.
-- Do not invent page numbers or source labels.
-- If you cannot support the answer, do not guess.
-
-SOURCES:
-{context}
-
-QUESTION:
-{question}
-"""
 
         response = ai.models.generate_content(
             model="gemini-3.8-flash",
-            contents=prompt
+            contents=build_prompt(question, matches, history)
         )
-
-        sources = []
-        for i, match in enumerate(matches, start=1):
-            page = match["metadata"].get("page", 0)
-            sources.append({
-                "source": f"Source {i}",
-                "page": page or None,
-                "text": match["text"]
-            })
+        answer = response.text or "I could not generate an answer."
+        sources = build_sources(matches)
+        add_message(conversation_id, "assistant", answer, sources)
 
         return {
-            "answer": response.text or
-                "I could not generate an answer.",
-            "sources": sources
+            "answer": answer,
+            "sources": sources,
+            "conversation_id": conversation_id
         }
 
     except Exception as error:
@@ -167,6 +234,86 @@ QUESTION:
             status_code=502,
             detail="Could not retrieve or generate an answer."
         )
+
+
+@app.post("/ask/stream")
+def ask_question_stream(request: QuestionRequest):
+    question = request.question.strip()
+
+    if not question:
+        raise HTTPException(
+            status_code=400,
+            detail="Question cannot be empty."
+        )
+
+    conversation_id = resolve_conversation(
+        request.document_id,
+        request.conversation_id
+    )
+    history = get_messages(conversation_id, limit=12)
+    add_message(conversation_id, "user", question)
+
+    try:
+        matches = search_chunks(
+            document_id=request.document_id,
+            question=question,
+            top_k=5
+        )
+    except Exception as error:
+        print("Question retrieval error:", error)
+        raise HTTPException(
+            status_code=502,
+            detail="Could not retrieve or generate an answer."
+        )
+
+    sources = build_sources(matches)
+
+    def stream_events():
+        yield sse_event("conversation", {"conversation_id": conversation_id})
+        yield sse_event("sources", {"sources": sources})
+
+        if not matches:
+            answer = "I could not find that information in the document."
+            add_message(conversation_id, "assistant", answer, sources)
+            yield sse_event(
+                "token",
+                {"text": answer}
+            )
+            yield sse_event("done", {})
+            return
+
+        try:
+            response_stream = ai.models.generate_content_stream(
+                model="gemini-3.8-flash",
+                contents=build_prompt(question, matches, history)
+            )
+
+            answer_parts = []
+            for chunk in response_stream:
+                if chunk.text:
+                    answer_parts.append(chunk.text)
+                    yield sse_event("token", {"text": chunk.text})
+
+            answer = "".join(answer_parts) or "I could not generate an answer."
+            if not answer_parts:
+                yield sse_event("token", {"text": answer})
+            add_message(conversation_id, "assistant", answer, sources)
+            yield sse_event("done", {})
+        except Exception as error:
+            print("Question streaming error:", error)
+            yield sse_event(
+                "error",
+                {"detail": "Could not retrieve or generate an answer."}
+            )
+
+    return StreamingResponse(
+        stream_events(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no"
+        }
+    )
 
 
 if FRONTEND_DIST.is_dir():
