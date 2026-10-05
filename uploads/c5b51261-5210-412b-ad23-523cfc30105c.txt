@@ -1,0 +1,166 @@
+# The Greenfield Project
+
+The Greenfield Project is a fictional technology and sustainability initiative started in 2024. Its primary objective is to develop affordable smart systems for monitoring energy consumption in small and medium-sized buildings.
+
+The project was founded by a team of five engineers: Arjun Mehta, Kavya Sharma, Rohan Verma, Neha Kapoor, and Daniel Thomas. The team initially operated from Chandigarh and later established a second development office in Bengaluru.
+
+## Project Objectives
+
+The Greenfield Project has four major objectives:
+
+1. Reduce unnecessary electricity consumption in commercial buildings.
+2. Provide building owners with real-time energy usage information.
+3. Develop a low-cost monitoring device that can be installed without replacing existing electrical infrastructure.
+4. Store historical energy data so that organizations can identify long-term consumption patterns.
+
+The team estimates that intelligent monitoring can reduce electricity wastage by approximately 12–18% in buildings where energy usage is not actively monitored.
+
+## Technology Stack
+
+The backend system uses Node.js and Express.js. MongoDB is used as the primary database for storing building information, sensor readings, and user accounts.
+
+The frontend dashboard is developed using React.js. The dashboard contains three main sections: Current Consumption, Historical Usage, and Alerts.
+
+The system communicates with sensors through a REST API. Each sensor sends information containing a device identifier, timestamp, voltage, current, and calculated power consumption.
+
+## Smart Sensor
+
+The Greenfield sensor is called GF-S1.
+
+The GF-S1 device measures approximately 8 centimeters by 5 centimeters and weighs 120 grams. It can operate continuously for up to 24 months before its internal backup battery needs replacement.
+
+Each sensor sends data every five minutes under normal operating conditions. During a network failure, the sensor temporarily stores readings locally and uploads them when connectivity is restored.
+
+A unique sensor ID is assigned during installation. The ID cannot be changed through the dashboard.
+
+## Data Processing
+
+Incoming sensor readings are validated before being stored in MongoDB.
+
+If voltage is below 180 volts or above 260 volts, the system marks the reading as abnormal. Abnormal readings are stored but excluded from standard energy-efficiency calculations.
+
+The system calculates daily consumption by aggregating valid readings collected during a 24-hour period.
+
+Weekly reports are generated every Monday at 7:00 AM.
+
+Monthly reports are generated on the first day of each month.
+
+## User Roles
+
+There are three types of users in the Greenfield system.
+
+### Administrator
+
+Administrators can create buildings, register sensors, remove sensors, create users, and view all reports.
+
+### Manager
+
+Managers can view buildings assigned to them and access energy reports. Managers cannot delete sensors or create administrator accounts.
+
+### Viewer
+
+Viewers have read-only access to dashboards. They cannot modify building information or sensor settings.
+
+## Security
+
+The Greenfield API uses JSON Web Tokens for authentication.
+
+Passwords are never stored in plain text. Passwords are hashed before being stored in the database.
+
+API requests that modify building or sensor information require authentication.
+
+Read-only public reports do not require an administrator account, but they use a separate access token generated for each report.
+
+## Greenfield Headquarters
+
+The original Greenfield office is located in Chandigarh. The office contains 14 employees and has two meeting rooms.
+
+The Bengaluru office was opened in March 2025. It currently has 21 employees and focuses primarily on hardware development and sensor testing.
+
+The company plans to establish a third office in Pune in the future.
+
+## Important Dates
+
+The Greenfield Project was officially announced on June 15, 2024.
+
+The first prototype was completed on September 8, 2024.
+
+The first field test started on November 20, 2024.
+
+The Chandigarh office moved to a larger facility on February 3, 2025.
+
+The Bengaluru office opened on March 18, 2025.
+
+The first commercial deployment was completed on July 12, 2025.
+
+## Pilot Deployment
+
+The first pilot deployment included 25 buildings in Chandigarh.
+
+A total of 150 GF-S1 sensors were installed during the pilot.
+
+Each building received between four and eight sensors depending on its electrical layout.
+
+The pilot lasted for three months.
+
+At the end of the pilot, the project team reported that data availability was 96.4%. The remaining readings were unavailable primarily because of network interruptions.
+
+## Future Plans
+
+The Greenfield team plans to introduce machine-learning-based energy consumption predictions.
+
+The proposed prediction system will analyze historical electricity consumption, building occupancy, weather conditions, and previous equipment behavior.
+
+Another planned feature is automatic anomaly detection.
+
+For example, if a building normally consumes 80–100 units of electricity during a particular period and suddenly consumes 180 units, the system may generate an alert for the manager.
+
+The team is also considering integration with solar power systems.
+
+## Frequently Mentioned Facts
+
+The Greenfield Project was started in 2024.
+
+The original office is in Chandigarh.
+
+The second office is in Bengaluru.
+
+The primary database is MongoDB.
+
+The backend uses Node.js and Express.js.
+
+The frontend uses React.js.
+
+The primary sensor is called GF-S1.
+
+Sensors normally send readings every five minutes.
+
+Weekly reports are generated every Monday at 7:00 AM.
+
+There are three user roles: Administrator, Manager, and Viewer.
+
+The first pilot involved 25 buildings and 150 sensors.
+
+The first commercial deployment occurred on July 12, 2025.
+
+## Example Incident
+
+On December 14, 2025, Building GF-017 reported unusually high electricity consumption.
+
+The building normally consumed between 420 and 470 units per day. On December 14, consumption reached 691 units.
+
+The system generated an anomaly alert at 4:35 PM.
+
+The building manager inspected the premises and discovered that an industrial cooling system had remained active after working hours.
+
+After the cooling system was switched off, consumption returned to normal levels the following day.
+
+The incident demonstrated how historical consumption data and automated alerts could help identify unusual energy usage.
+
+## Conclusion
+
+The Greenfield Project combines IoT sensors, cloud-based data storage, web dashboards, and automated analysis to help organizations understand electricity consumption.
+
+Although the project began as a small five-person initiative, its development team expanded after the successful Chandigarh pilot.
+
+The long-term goal is to provide an affordable monitoring platform that can be used by schools, offices, factories, warehouses, and small retail businesses.

@@ -12,7 +12,7 @@ from google.genai.errors import APIError
 # Load .env before importing services
 load_dotenv()
 
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException, Depends
 from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -27,6 +27,12 @@ from services.conversation_store import (
     get_conversation,
     get_messages,
 )
+from services.auth_service import (
+    auth_router,
+    get_current_user,
+    record_document_owner,
+    user_owns_document,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -36,9 +42,17 @@ API_KEY = os.getenv("GEMINI_API_KEY")
 if not API_KEY:
     raise RuntimeError("GEMINI_API_KEY is missing from .env")
 
+PRIMARY_MODEL = os.getenv("GEMINI_PRIMARY_MODEL", "gemini-3.8-flash").strip() or "gemini-3.8-flash"
+FALLBACK_MODEL = os.getenv("GEMINI_FALLBACK_MODEL", "gemini-3.1-flash-lite").strip()
+NO_RELEVANT_PASSAGES_ANSWER = (
+    "I couldn't find sufficiently relevant information in the uploaded document. "
+    "Try rephrasing your question or asking about a specific section."
+)
+
 ai = genai.Client(api_key=API_KEY)
 
 app = FastAPI(title="Gemini RAG Document Assistant")
+app.include_router(auth_router)
 
 UPLOAD_DIR = Path("uploads")
 UPLOAD_DIR.mkdir(exist_ok=True)
@@ -49,6 +63,14 @@ class QuestionRequest(BaseModel):
     document_id: str
     question: str
     conversation_id: str | None = None
+
+
+class ModelFallbackError(Exception):
+    def __init__(self, primary_model, primary_error, fallback_model, fallback_error):
+        self.primary_model = primary_model
+        self.primary_error = primary_error
+        self.fallback_model = fallback_model
+        self.fallback_error = fallback_error
 
 
 def build_prompt(question, matches, history=None):
@@ -109,7 +131,55 @@ def sse_event(name, data):
     return f"event: {name}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
 
 
+def generation_models():
+    models = [model for model in (PRIMARY_MODEL, FALLBACK_MODEL) if model]
+    return list(dict.fromkeys(models))
+
+
+def should_try_fallback(error):
+    if isinstance(error, APIError):
+        return error.code in (404, 408, 429, 500, 502, 503, 504)
+    return isinstance(error, (httpx.TimeoutException, httpx.NetworkError))
+
+
+def generate_content_with_fallback(prompt):
+    models = generation_models()
+    primary_model = models[0]
+
+    try:
+        response = ai.models.generate_content(model=primary_model, contents=prompt)
+        return response, primary_model
+    except Exception as primary_error:
+        if len(models) < 2 or not should_try_fallback(primary_error):
+            raise
+
+        fallback_model = models[1]
+        logger.warning(
+            "Primary Gemini model %s failed; trying fallback model %s",
+            primary_model,
+            fallback_model
+        )
+        try:
+            response = ai.models.generate_content(model=fallback_model, contents=prompt)
+            return response, fallback_model
+        except Exception as fallback_error:
+            raise ModelFallbackError(
+                primary_model,
+                primary_error,
+                fallback_model,
+                fallback_error
+            ) from fallback_error
+
+
 def explain_error(error, operation):
+    if isinstance(error, ModelFallbackError):
+        _, primary_detail = explain_error(error.primary_error, operation)
+        status_code, fallback_detail = explain_error(error.fallback_error, operation)
+        return status_code, (
+            f"Both Gemini models failed. {error.primary_model}: {primary_detail} "
+            f"Fallback {error.fallback_model}: {fallback_detail}"
+        )
+
     if isinstance(error, APIError):
         code = error.code
         provider_message = " ".join(str(error.message or "").split())[:500]
@@ -176,11 +246,20 @@ def resolve_conversation(document_id, conversation_id):
     return conversation_id
 
 
+def ensure_document_access(document_id, current_user):
+    if not user_owns_document(document_id, current_user["id"]):
+        raise HTTPException(status_code=404, detail="Document not found.")
+
+
 @app.get("/conversations/{conversation_id}")
-def get_conversation_history(conversation_id: str):
+def get_conversation_history(
+    conversation_id: str,
+    current_user: dict = Depends(get_current_user)
+):
     conversation = get_conversation(conversation_id)
     if conversation is None:
         raise HTTPException(status_code=404, detail="Conversation not found.")
+    ensure_document_access(conversation["document_id"], current_user)
 
     return {
         "conversation_id": conversation_id,
@@ -190,7 +269,10 @@ def get_conversation_history(conversation_id: str):
 
 
 @app.post("/upload")
-async def upload_document(file: UploadFile = File(...)):
+async def upload_document(
+    file: UploadFile = File(...),
+    current_user: dict = Depends(get_current_user)
+):
     filename = file.filename or ""
     extension = Path(filename).suffix.lower()
 
@@ -218,6 +300,7 @@ async def upload_document(file: UploadFile = File(...)):
         chunks = chunk_documents(pages)
 
         count = store_chunks(document_id, chunks)
+        record_document_owner(document_id, current_user["id"])
 
         return {
             "message": "Document processed successfully",
@@ -239,7 +322,10 @@ async def upload_document(file: UploadFile = File(...)):
 
 
 @app.post("/ask")
-async def ask_question(request: QuestionRequest):
+async def ask_question(
+    request: QuestionRequest,
+    current_user: dict = Depends(get_current_user)
+):
     question = request.question.strip()
 
     if not question:
@@ -248,6 +334,7 @@ async def ask_question(request: QuestionRequest):
             detail="Question cannot be empty."
         )
 
+    ensure_document_access(request.document_id, current_user)
     conversation_id = resolve_conversation(
         request.document_id,
         request.conversation_id
@@ -263,7 +350,7 @@ async def ask_question(request: QuestionRequest):
         )
 
         if not matches:
-            answer = "I could not find that information in the document."
+            answer = NO_RELEVANT_PASSAGES_ANSWER
             add_message(conversation_id, "assistant", answer)
             return {
                 "answer": answer,
@@ -271,9 +358,8 @@ async def ask_question(request: QuestionRequest):
                 "conversation_id": conversation_id
             }
 
-        response = ai.models.generate_content(
-            model="gemini-3.8-flash",
-            contents=build_prompt(question, matches, history)
+        response, used_model = generate_content_with_fallback(
+            build_prompt(question, matches, history)
         )
         answer = response.text or "I could not generate an answer."
         sources = build_sources(matches)
@@ -282,7 +368,8 @@ async def ask_question(request: QuestionRequest):
         return {
             "answer": answer,
             "sources": sources,
-            "conversation_id": conversation_id
+            "conversation_id": conversation_id,
+            "model": used_model
         }
 
     except Exception as error:
@@ -294,7 +381,10 @@ async def ask_question(request: QuestionRequest):
 
 
 @app.post("/ask/stream")
-def ask_question_stream(request: QuestionRequest):
+def ask_question_stream(
+    request: QuestionRequest,
+    current_user: dict = Depends(get_current_user)
+):
     question = request.question.strip()
 
     if not question:
@@ -303,6 +393,7 @@ def ask_question_stream(request: QuestionRequest):
             detail="Question cannot be empty."
         )
 
+    ensure_document_access(request.document_id, current_user)
     conversation_id = resolve_conversation(
         request.document_id,
         request.conversation_id
@@ -330,7 +421,7 @@ def ask_question_stream(request: QuestionRequest):
         yield sse_event("sources", {"sources": sources})
 
         if not matches:
-            answer = "I could not find that information in the document."
+            answer = NO_RELEVANT_PASSAGES_ANSWER
             add_message(conversation_id, "assistant", answer, sources)
             yield sse_event(
                 "token",
@@ -340,21 +431,62 @@ def ask_question_stream(request: QuestionRequest):
             return
 
         try:
-            response_stream = ai.models.generate_content_stream(
-                model="gemini-3.8-flash",
-                contents=build_prompt(question, matches, history)
-            )
-
+            models = generation_models()
             answer_parts = []
-            for chunk in response_stream:
-                if chunk.text:
-                    answer_parts.append(chunk.text)
-                    yield sse_event("token", {"text": chunk.text})
+            previous_error = None
+            used_model = None
+            for model_index, model in enumerate(models):
+                if model_index > 0:
+                    yield sse_event("model_fallback", {
+                        "message": f"{models[0]} is unavailable; switching to {model}."
+                    })
+
+                try:
+                    response_stream = ai.models.generate_content_stream(
+                        model=model,
+                        contents=build_prompt(question, matches, history)
+                    )
+
+                    for chunk in response_stream:
+                        if chunk.text:
+                            answer_parts.append(chunk.text)
+                            yield sse_event("token", {"text": chunk.text})
+
+                    used_model = model
+                    break
+                except Exception as error:
+                    if answer_parts:
+                        if previous_error is not None:
+                            raise ModelFallbackError(
+                                models[0],
+                                previous_error,
+                                model,
+                                error
+                            ) from error
+                        raise
+                    if model_index + 1 < len(models) and should_try_fallback(error):
+                        previous_error = error
+                        logger.warning(
+                            "Primary Gemini model %s failed before streaming output; "
+                            "trying fallback model %s",
+                            model,
+                            models[model_index + 1]
+                        )
+                        continue
+                    if previous_error is not None:
+                        raise ModelFallbackError(
+                            models[0],
+                            previous_error,
+                            model,
+                            error
+                        ) from error
+                    raise
 
             answer = "".join(answer_parts) or "I could not generate an answer."
             if not answer_parts:
                 yield sse_event("token", {"text": answer})
             add_message(conversation_id, "assistant", answer, sources)
+            yield sse_event("model", {"name": used_model})
             yield sse_event("done", {})
         except Exception as error:
             _, detail = explain_error(error, "generating an answer")

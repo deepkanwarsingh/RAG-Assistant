@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 
 const SESSION_STORAGE_KEY = 'rag-assistant-session';
+const AUTH_STORAGE_KEY = 'rag-assistant-auth';
 
 function readSavedSession() {
   try {
@@ -21,6 +22,30 @@ function saveSession(session) {
 function clearSession() {
   try {
     localStorage.removeItem(SESSION_STORAGE_KEY);
+  } catch {
+    // Ignore unavailable browser storage.
+  }
+}
+
+function readSavedAuth() {
+  try {
+    return JSON.parse(localStorage.getItem(AUTH_STORAGE_KEY) || 'null');
+  } catch {
+    return null;
+  }
+}
+
+function saveAuth(auth) {
+  try {
+    localStorage.setItem(AUTH_STORAGE_KEY, JSON.stringify(auth));
+  } catch {
+    // Keep the current login usable for this browser session.
+  }
+}
+
+function clearAuth() {
+  try {
+    localStorage.removeItem(AUTH_STORAGE_KEY);
   } catch {
     // Ignore unavailable browser storage.
   }
@@ -81,6 +106,10 @@ async function readEventStream(response, onEvent) {
 function collectConversationSources(messages) {
   const sources = new Map();
   let currentQuestion = '';
+  const latestAssistant = [...messages].reverse().find((message) => message.role === 'assistant');
+  const latestSourceKeys = new Set((latestAssistant?.sources ?? []).map((source) => (
+    `${source.page ?? 'text'}\u0000${source.text ?? ''}`
+  )));
 
   for (const message of messages) {
     if (message.role === 'user') {
@@ -108,10 +137,19 @@ function collectConversationSources(messages) {
     }
   }
 
-  return [...sources.values()];
+  return [...sources.entries()].map(([key, source]) => ({
+    ...source,
+    isCurrent: latestSourceKeys.has(key),
+  }));
 }
 
 export default function App() {
+  const [auth, setAuth] = useState(null);
+  const [authMode, setAuthMode] = useState('login');
+  const [authEmail, setAuthEmail] = useState('');
+  const [authPassword, setAuthPassword] = useState('');
+  const [authStatus, setAuthStatus] = useState(null);
+  const [authBusy, setAuthBusy] = useState(false);
   const [file, setFile] = useState(null);
   const [documentInfo, setDocumentInfo] = useState(null);
   const [documentId, setDocumentId] = useState(null);
@@ -129,30 +167,58 @@ export default function App() {
     let cancelled = false;
 
     async function restoreSession() {
-      const savedSession = readSavedSession();
-      if (!savedSession?.documentId) {
+      const savedAuth = readSavedAuth();
+      if (!savedAuth?.access_token) {
         setRestoring(false);
         return;
       }
 
-      setDocumentId(savedSession.documentId);
-      setDocumentInfo(savedSession.documentInfo ?? null);
-
-      if (savedSession.conversationId) {
-        try {
-          const response = await fetch(
-            `/conversations/${encodeURIComponent(savedSession.conversationId)}`,
-          );
-          const data = await readResponse(response, 'Could not restore this conversation.');
-          if (cancelled) return;
-          setConversationId(data.conversation_id);
-          setMessages(data.messages ?? []);
-        } catch {
-          if (cancelled) return;
-          saveSession({ ...savedSession, conversationId: null });
-          setConversationId(null);
-          setMessages([]);
+      const headers = { Authorization: `Bearer ${savedAuth.access_token}` };
+      try {
+        const authResponse = await fetch('/auth/me', { headers });
+        if (authResponse.status === 401) {
+          clearAuth();
+          clearSession();
+          return;
         }
+        const authData = await readResponse(authResponse, 'Could not verify your login.');
+        if (cancelled) return;
+        const restoredAuth = { ...savedAuth, user: authData.user };
+        setAuth(restoredAuth);
+        saveAuth(restoredAuth);
+
+        const savedSession = readSavedSession();
+        if (!savedSession?.documentId || savedSession.userId !== authData.user.id) {
+          if (savedSession) clearSession();
+          return;
+        }
+
+        setDocumentId(savedSession.documentId);
+        setDocumentInfo(savedSession.documentInfo ?? null);
+        if (savedSession.conversationId) {
+          try {
+            const response = await fetch(
+              `/conversations/${encodeURIComponent(savedSession.conversationId)}`,
+              { headers },
+            );
+            const data = await readResponse(response, 'Could not restore this conversation.');
+            if (cancelled) return;
+            setConversationId(data.conversation_id);
+            setMessages(data.messages ?? []);
+          } catch {
+            if (cancelled) return;
+            saveSession({ ...savedSession, conversationId: null });
+            setConversationId(null);
+            setMessages([]);
+          }
+        }
+      } catch (error) {
+        if (!cancelled) {
+          setAuth(savedAuth);
+          setAuthStatus({ type: 'error', text: error.message });
+        }
+      } finally {
+        if (!cancelled) setRestoring(false);
       }
 
       if (!cancelled) setRestoring(false);
@@ -161,6 +227,78 @@ export default function App() {
     restoreSession();
     return () => { cancelled = true; };
   }, []);
+
+  function clearAuthenticatedState() {
+    clearAuth();
+    clearSession();
+    setAuth(null);
+    setDocumentId(null);
+    setDocumentInfo(null);
+    setConversationId(null);
+    setMessages([]);
+  }
+
+  async function handleAuthSubmit(event) {
+    event.preventDefault();
+    setAuthBusy(true);
+    setAuthStatus(null);
+    try {
+      const response = await fetch(`/auth/${authMode}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email: authEmail, password: authPassword }),
+      });
+      const data = await readResponse(response, 'Could not sign in. Please try again.');
+      setAuth(data);
+      saveAuth(data);
+      setAuthPassword('');
+
+      const savedSession = readSavedSession();
+      if (savedSession?.userId === data.user.id) {
+        setDocumentId(savedSession.documentId);
+        setDocumentInfo(savedSession.documentInfo ?? null);
+        if (savedSession.conversationId) {
+          const historyResponse = await fetch(
+            `/conversations/${encodeURIComponent(savedSession.conversationId)}`,
+            { headers: { Authorization: `Bearer ${data.access_token}` } },
+          );
+          if (historyResponse.ok) {
+            const historyData = await historyResponse.json();
+            setConversationId(historyData.conversation_id);
+            setMessages(historyData.messages ?? []);
+          } else {
+            setConversationId(null);
+            setMessages([]);
+            saveSession({ ...savedSession, conversationId: null });
+          }
+        }
+      } else {
+        clearSession();
+        setDocumentId(null);
+        setDocumentInfo(null);
+        setConversationId(null);
+        setMessages([]);
+      }
+    } catch (error) {
+      setAuthStatus({ type: 'error', text: error.message });
+    } finally {
+      setAuthBusy(false);
+    }
+  }
+
+  async function handleLogout() {
+    if (auth?.access_token) {
+      try {
+        await fetch('/auth/logout', {
+          method: 'POST',
+          headers: { Authorization: `Bearer ${auth.access_token}` },
+        });
+      } catch {
+        // Clear the local session even if the server cannot be reached.
+      }
+    }
+    clearAuthenticatedState();
+  }
 
   async function handleUpload(event) {
     event.preventDefault();
@@ -191,7 +329,11 @@ export default function App() {
     clearSession();
 
     try {
-      const response = await fetch('/upload', { method: 'POST', body: formData });
+      const response = await fetch('/upload', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${auth.access_token}` },
+        body: formData,
+      });
       const data = await readResponse(response, 'Upload failed. Please try again.');
       if (!data.document_id) {
         throw new Error('Upload succeeded, but the server did not return a document ID.');
@@ -203,6 +345,7 @@ export default function App() {
         documentId: data.document_id,
         documentInfo: data,
         conversationId: null,
+        userId: auth.user.id,
       });
       setUploadStatus({
         type: 'success',
@@ -240,7 +383,10 @@ export default function App() {
     try {
       const response = await fetch('/ask/stream', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${auth.access_token}`,
+        },
         body: JSON.stringify({
           document_id: documentId,
           question: trimmedQuestion,
@@ -259,6 +405,7 @@ export default function App() {
             documentId,
             documentInfo,
             conversationId: data.conversation_id,
+            userId: auth.user.id,
           });
         } else if (eventName === 'sources') {
           setMessages((current) => current.map((message, index) => (
@@ -273,6 +420,8 @@ export default function App() {
               : message
           )));
           setAskStatus(null);
+        } else if (eventName === 'model_fallback') {
+          setAskStatus({ type: 'pending', text: data.message });
         } else if (eventName === 'error') {
           throw new Error(data.detail || 'Could not get an answer.');
         } else if (eventName === 'done') {
@@ -292,9 +441,58 @@ export default function App() {
     }
   }
 
+  if (restoring) {
+    return <main className="container">Loading...</main>;
+  }
+
+  if (!auth) {
+    return (
+      <main className="auth-page">
+        <form className="auth-form" onSubmit={handleAuthSubmit}>
+          <h1>{authMode === 'login' ? 'Sign in' : 'Create account'}</h1>
+          <label htmlFor="auth-email">Email</label>
+          <input
+            id="auth-email"
+            type="email"
+            autoComplete="email"
+            value={authEmail}
+            onChange={(event) => setAuthEmail(event.target.value)}
+            required
+          />
+          <label htmlFor="auth-password">Password</label>
+          <input
+            id="auth-password"
+            type="password"
+            autoComplete={authMode === 'login' ? 'current-password' : 'new-password'}
+            minLength={authMode === 'login' ? 1 : 8}
+            maxLength={128}
+            value={authPassword}
+            onChange={(event) => setAuthPassword(event.target.value)}
+            required
+          />
+          <button className="primary-button" type="submit" disabled={authBusy}>
+            {authBusy ? 'Please wait...' : authMode === 'login' ? 'Sign in' : 'Create account'}
+          </button>
+          {authStatus && <p className={`status ${authStatus.type}`} role="alert">{authStatus.text}</p>}
+          <button
+            className="auth-mode-button"
+            type="button"
+            onClick={() => {
+              setAuthMode(authMode === 'login' ? 'register' : 'login');
+              setAuthStatus(null);
+            }}
+          >
+            {authMode === 'login' ? 'Create an account' : 'I already have an account'}
+          </button>
+        </form>
+      </main>
+    );
+  }
+
   return (
     <main className="container">
       <header className="header">
+        <button className="sign-out-button" type="button" onClick={handleLogout}>Sign out</button>
         <p className="eyebrow">AI Knowledge Workspace</p>
         <h1>Gemini Document Assistant</h1>
         <p className="subtitle">
@@ -338,57 +536,74 @@ export default function App() {
         )}
       </section>
 
-      <section className="card" aria-labelledby="question-heading">
-        <div className="section-heading">
-          <span className="step">2</span>
-          <h2 id="question-heading">Ask a question</h2>
-        </div>
-        <p className="help-text">Ask anything about the document you uploaded.</p>
-        <form onSubmit={handleAsk}>
-          <label className="visually-hidden" htmlFor="question-input">Your question</label>
-          <textarea
-            id="question-input"
-            placeholder="Example: What is this document about? Summarize it in 20 words."
-            value={question}
-            onChange={(event) => setQuestion(event.target.value)}
-            required
-          />
-          <button className="primary-button" type="submit" disabled={!documentId || asking}>
-            {asking ? 'Thinking...' : 'Ask Gemini'}
-          </button>
-        </form>
-        {askStatus && <p className={`status ${askStatus.type}`} role="status">{askStatus.text}</p>}
-
-        {messages.length > 0 && (
-          <div className="conversation-history">
-            {messages.map((message, index) => (
-              <article className={`message-row ${message.role}`} key={message.id ?? `${index}-${message.role}`}>
-                <h3 className="message-role">{message.role === 'user' ? 'You' : 'Assistant'}</h3>
-                <div className={message.role === 'user' ? 'user-message' : 'answer'}>
-                  {message.content || (asking && index === messages.length - 1 ? 'Generating answer...' : 'No answer was returned.')}
-                </div>
-              </article>
-            ))}
+      <div className="workspace-grid">
+        <section className="card chat-card" aria-labelledby="question-heading">
+          <div className="section-heading">
+            <span className="step">2</span>
+            <h2 id="question-heading">Ask a question</h2>
           </div>
-        )}
+          <p className="help-text">Ask anything about the document you uploaded.</p>
+          <form onSubmit={handleAsk}>
+            <label className="visually-hidden" htmlFor="question-input">Your question</label>
+            <textarea
+              id="question-input"
+              placeholder="Example: What is this document about? Summarize it in 20 words."
+              value={question}
+              onChange={(event) => setQuestion(event.target.value)}
+              required
+            />
+            <button className="primary-button" type="submit" disabled={!documentId || asking || restoring}>
+              {asking ? 'Thinking...' : 'Ask Gemini'}
+            </button>
+          </form>
+          {askStatus && <p className={`status ${askStatus.type}`} role="status">{askStatus.text}</p>}
 
-        {conversationSources.length > 0 && (
-          <section className="conversation-sources" aria-labelledby="sources-heading">
-            <h3 id="sources-heading">Document sources</h3>
-            {conversationSources.map((source, index) => (
-              <article className="source-card" key={`${source.page ?? 'text'}-${index}`}>
-                <h4 className="source-title">
-                  {source.references.map((reference) => reference.label).join(', ')} · {source.page ? `Page ${source.page}` : 'Text file'}
-                </h4>
-                <p className="source-text">{source.text || ''}</p>
-                <p className="source-reference">
-                  Used for: {source.references.map((reference) => reference.question).filter(Boolean).join(' / ')}
-                </p>
-              </article>
-            ))}
-          </section>
-        )}
-      </section>
+          {messages.length > 0 && (
+            <div className="conversation-history" aria-live="polite">
+              {messages.map((message, index) => (
+                <article className={`message-row ${message.role}`} key={message.id ?? `${index}-${message.role}`}>
+                  <h3 className="message-role">{message.role === 'user' ? 'You' : 'Assistant'}</h3>
+                  <div className={message.role === 'user' ? 'user-message' : 'answer'}>
+                    {message.content || (asking && index === messages.length - 1 ? 'Generating answer...' : 'No answer was returned.')}
+                  </div>
+                </article>
+              ))}
+            </div>
+          )}
+        </section>
+
+        <aside className="source-panel" aria-labelledby="sources-heading">
+          <div className="source-panel-heading">
+            <div>
+              <p className="source-kicker">Reference</p>
+              <h2 id="sources-heading">Document sources</h2>
+            </div>
+            {conversationSources.length > 0 && (
+              <span className="source-count">{conversationSources.length}</span>
+            )}
+          </div>
+          {conversationSources.length === 0 ? (
+            <p className="source-empty">
+              {messages.length > 0 ? 'No relevant passages found for this answer.' : 'No sources retrieved yet.'}
+            </p>
+          ) : (
+            <div className="source-list">
+              {conversationSources.map((source, index) => (
+                <article className={`source-card${source.isCurrent ? ' is-current' : ''}`} key={`${source.page ?? 'text'}-${index}`}>
+                  <h3 className="source-title">
+                    {source.page ? `Page ${source.page}` : 'Text file'}
+                  </h3>
+                  {source.isCurrent && <span className="source-current">Used in latest answer</span>}
+                  <p className="source-text">{source.text || ''}</p>
+                  <p className="source-reference">
+                    {source.references.map((reference) => reference.question).filter(Boolean).join(' / ')}
+                  </p>
+                </article>
+              ))}
+            </div>
+          )}
+        </aside>
+      </div>
 
       <footer className="footer">Powered by Gemini <span aria-hidden="true">·</span> Retrieval-Augmented Generation</footer>
     </main>
